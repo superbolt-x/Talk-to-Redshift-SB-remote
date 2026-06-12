@@ -7,6 +7,7 @@ tables, columns, and executes SELECT queries. Write operations are blocked.
 import logging
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from urllib.parse import urlparse
 
 import uvicorn
@@ -24,8 +25,9 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
 
-_server_url = os.environ.get("SERVER_URL", "").rstrip("/")
-_auth_token  = os.environ.get("MCP_AUTH_TOKEN", "")
+_server_url   = os.environ.get("SERVER_URL", "").rstrip("/")
+_auth_token   = os.environ.get("MCP_AUTH_TOKEN", "")
+_instructions = (Path(__file__).parent / "INSTRUCTIONS.md").read_text()
 
 if _server_url and _auth_token:
     from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
@@ -53,10 +55,7 @@ if _server_url and _auth_token:
 
     mcp = FastMCP(
         "Talk-to-Redshift",
-        instructions=(
-            "Read-only Redshift MCP. You can list clusters, databases, schemas, tables, "
-            "and columns, and execute SELECT queries. Write operations are not permitted."
-        ),
+        instructions=_instructions,
         auth=_auth_settings,
         auth_server_provider=_oauth_provider,
         transport_security=_transport_security,
@@ -66,10 +65,7 @@ else:
     _oauth_provider = None
     mcp = FastMCP(
         "Talk-to-Redshift",
-        instructions=(
-            "Read-only Redshift MCP. You can list clusters, databases, schemas, tables, "
-            "and columns, and execute SELECT queries. Write operations are not permitted."
-        ),
+        instructions=_instructions,
     )
     logger.warning("OAuth disabled — set SERVER_URL and MCP_AUTH_TOKEN to enable.")
 
