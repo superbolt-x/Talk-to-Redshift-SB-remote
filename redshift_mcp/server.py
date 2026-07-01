@@ -1,20 +1,28 @@
 """
-Talk-to-Redshift MCP Server.
+Talk-to-Redshift MCP Server (remote).
 
 Read-only Redshift access for Claude — lists clusters, databases, schemas,
-tables, columns, and executes SELECT queries. Write operations are blocked.
+tables, columns, and executes SQL queries.
+
+Auth model: AUTHLESS (Parker-style).
+  No OAuth is advertised, so Claude connects with no login step. If MCP_AUTH_TOKEN
+  is set, an ASGI gate requires that token on every MCP request — via the connector
+  URL (?access_token=...) or an `Authorization: Bearer <token>` header. /health is
+  always open. Leave MCP_AUTH_TOKEN empty to run fully open (rely on URL secrecy).
 """
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
 from redshift_mcp.tools import register_tools
@@ -25,51 +33,85 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
 
-_server_url   = os.environ.get("SERVER_URL", "").rstrip("/")
-_auth_token   = os.environ.get("MCP_AUTH_TOKEN", "")
+SERVER_URL = os.environ.get("SERVER_URL", "").rstrip("/")
+AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")  # optional URL/bearer gate
 _instructions = (Path(__file__).parent / "INSTRUCTIONS.md").read_text()
 
-if _server_url and _auth_token:
-    from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
-    from mcp.server.transport_security import TransportSecuritySettings
-    from redshift_mcp.oauth import SimpleMCPOAuthProvider
 
-    _oauth_provider = SimpleMCPOAuthProvider(auth_token=_auth_token)
+def _derive_allowed_hosts() -> list[str]:
+    """Hosts allowed through DNS-rebinding protection. Sourced from SERVER_URL
+    (scheme optional), Railway's auto-injected RAILWAY_PUBLIC_DOMAIN, and an
+    optional MCP_ALLOWED_HOSTS override. Prevents 421 'Invalid Host header'."""
+    candidates: list[str] = []
+    if SERVER_URL:
+        _u = SERVER_URL if "//" in SERVER_URL else "https://" + SERVER_URL
+        netloc = urlparse(_u).netloc
+        if netloc:
+            candidates.append(netloc)
+    rpd = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    if rpd:
+        candidates.append(rpd)
+    for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(","):
+        if h.strip():
+            candidates.append(h.strip())
+    seen, out = set(), []
+    for h in candidates:
+        if h not in seen:
+            seen.add(h)
+            out.append(h)
+    return out
 
-    _auth_settings = AuthSettings(
-        issuer_url=_server_url,
-        resource_server_url=f"{_server_url}/mcp",
-        client_registration_options=ClientRegistrationOptions(
-            enabled=True,
-            valid_scopes=["mcp"],
-            default_scopes=["mcp"],
-        ),
-    )
 
-    _hostname = urlparse(_server_url).netloc
+_allowed_hosts = _derive_allowed_hosts()
+if _allowed_hosts:
     _transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
-        allowed_hosts=[_hostname, f"{_hostname}:*"],
-        allowed_origins=[_server_url, f"{_server_url}:*"],
+        allowed_hosts=[x for h in _allowed_hosts for x in (h, f"{h}:*")],
+        allowed_origins=[x for h in _allowed_hosts for x in (f"https://{h}", f"http://{h}")],
     )
-
-    mcp = FastMCP(
-        "Talk-to-Redshift",
-        instructions=_instructions,
-        auth=_auth_settings,
-        auth_server_provider=_oauth_provider,
-        transport_security=_transport_security,
-    )
-    logger.info("OAuth enabled — issuer: %s  resource: %s/mcp", _server_url, _server_url)
+    logger.info("DNS-rebinding protection ON — allowed hosts: %s", _allowed_hosts)
 else:
-    _oauth_provider = None
-    mcp = FastMCP(
-        "Talk-to-Redshift",
-        instructions=_instructions,
-    )
-    logger.warning("OAuth disabled — set SERVER_URL and MCP_AUTH_TOKEN to enable.")
+    _transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    logger.warning("No SERVER_URL / RAILWAY_PUBLIC_DOMAIN — DNS-rebinding protection OFF")
+
+mcp = FastMCP(
+    "Talk-to-Redshift",
+    instructions=_instructions,
+    transport_security=_transport_security,
+)
+logger.info("Talk-to-Redshift configured — server_url=%s auth_gate=%s",
+            SERVER_URL or "(unset)", bool(AUTH_TOKEN))
 
 register_tools(mcp)
+
+
+class TokenGateMiddleware:
+    """Authless-with-a-shared-secret ASGI gate. When a token is configured,
+    require it on every HTTP request (from ?access_token=/token or Bearer).
+    Correct token → pass through (no auth challenge); otherwise 401."""
+
+    def __init__(self, app, token: str):
+        self._app = app
+        self._token = token
+
+    def _provided(self, scope) -> str:
+        qs = parse_qs(scope.get("query_string", b"").decode("latin-1"))
+        val = (qs.get("access_token") or qs.get("token") or [""])[0]
+        if val:
+            return val
+        for k, v in scope.get("headers") or []:
+            if k == b"authorization":
+                auth = v.decode("latin-1")
+                if auth.lower().startswith("bearer "):
+                    return auth[7:].strip()
+        return ""
+
+    async def __call__(self, scope, receive, send):
+        if self._token and scope.get("type") == "http":
+            if not secrets.compare_digest(self._provided(scope), self._token):
+                await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
+                return
+        await self._app(scope, receive, send)
 
 
 def main() -> None:
@@ -81,77 +123,29 @@ def main() -> None:
         mcp.run(transport=transport)
         return
 
-    _raw_mcp_app = mcp.streamable_http_app()
-
-    # Fix for Railway: Content-Type on /token must be application/x-www-form-urlencoded
-    # but some clients send it without the header — this middleware patches the receive.
-    from starlette.types import ASGIApp, Receive, Scope, Send
-
-    class _GrantTypeFixMiddleware:
-        def __init__(self, app: ASGIApp) -> None:
-            self._app = app
-
-        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-            if scope["type"] == "http" and scope.get("path", "").endswith("/token"):
-                body_sent = False
-
-                async def _patched_receive():
-                    nonlocal body_sent
-                    msg = await receive()
-                    if msg["type"] == "http.request" and not body_sent:
-                        body = msg.get("body", b"")
-                        body_sent = True
-                        return {"type": "http.request", "body": body, "more_body": False}
-                    return {"type": "http.disconnect"}
-
-                await self._app(scope, _patched_receive, send)
-            else:
-                await self._app(scope, receive, send)
-
-    mcp_app = _GrantTypeFixMiddleware(_raw_mcp_app)
+    raw_app = mcp.streamable_http_app()
+    gated_app = TokenGateMiddleware(raw_app, token=AUTH_TOKEN)
 
     @asynccontextmanager
     async def lifespan(_app):
-        async with _raw_mcp_app.router.lifespan_context(_app):
+        async with raw_app.router.lifespan_context(_app):
             yield
 
     async def health(_: Request) -> JSONResponse:
         return JSONResponse({
             "status": "ok",
             "transport": transport,
-            "oauth": bool(_oauth_provider),
+            "auth_gate": bool(AUTH_TOKEN),
         })
 
-    async def oauth_approve(request: Request) -> HTMLResponse | RedirectResponse:
-        if _oauth_provider is None:
-            return HTMLResponse("OAuth not configured.", status_code=503)
-
-        pending_id = request.query_params.get("pending_id", "")
-
-        if request.method == "GET":
-            return HTMLResponse(_oauth_provider.render_approve_form(pending_id))
-
-        form = await request.form()
-        passphrase = str(form.get("passphrase", ""))
-        pending_id = str(form.get("pending_id", pending_id))
-        ok, redirect_url, error = _oauth_provider.handle_approval(pending_id, passphrase)
-
-        if ok and redirect_url:
-            return RedirectResponse(redirect_url, status_code=302)
-
-        return HTMLResponse(
-            _oauth_provider.render_approve_form(pending_id, error or "Authorization failed."),
-            status_code=400,
-        )
-
-    routes = [
-        Route("/health", health),
-        Route("/oauth/approve", oauth_approve, methods=["GET", "POST"]),
-        Mount("/", app=mcp_app),
-    ]
-
-    app = Starlette(lifespan=lifespan, routes=routes)
-    logger.info("Listening on %s:%s", host, port)
+    app = Starlette(
+        lifespan=lifespan,
+        routes=[
+            Route("/health", health),
+            Mount("/", app=gated_app),
+        ],
+    )
+    logger.info("Listening on %s:%s — auth_gate=%s", host, port, bool(AUTH_TOKEN))
     uvicorn.run(app, host=host, port=port)
 
 

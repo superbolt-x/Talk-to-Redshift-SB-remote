@@ -12,8 +12,13 @@ import re
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 logger = logging.getLogger("talk-to-redshift.tools")
+
+# All tools are read-only: list_* are metadata reads, and execute_query rejects
+# every write statement (see _WRITE_PATTERN) before it reaches the database.
+_RO = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True)
 
 _WRITE_PATTERN = re.compile(
     r"^\s*(INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE|GRANT|REVOKE|COPY|UNLOAD|MERGE|REPLACE)\b",
@@ -85,7 +90,7 @@ def _run_query(sql: str, database: str) -> dict:
 
 def register_tools(mcp: FastMCP) -> None:
 
-    @mcp.tool()
+    @mcp.tool(annotations=_RO)
     def list_clusters() -> list[dict]:
         """List all available Redshift provisioned clusters and serverless workgroups."""
         results = []
@@ -121,7 +126,7 @@ def register_tools(mcp: FastMCP) -> None:
 
         return results
 
-    @mcp.tool()
+    @mcp.tool(annotations=_RO)
     def list_databases() -> list[str]:
         """
         List all client databases available in the Redshift cluster.
@@ -148,7 +153,7 @@ def register_tools(mcp: FastMCP) -> None:
             databases.extend(page.get("Databases", []))
         return sorted(databases)
 
-    @mcp.tool()
+    @mcp.tool(annotations=_RO)
     def list_schemas(database: str) -> dict:
         """
         List all schemas in a client database.
@@ -164,7 +169,7 @@ def register_tools(mcp: FastMCP) -> None:
         )
         return _run_query(sql, database=database)
 
-    @mcp.tool()
+    @mcp.tool(annotations=_RO)
     def list_tables(database: str, schema: str = "public") -> dict:
         """
         List all tables in a schema.
@@ -181,7 +186,7 @@ def register_tools(mcp: FastMCP) -> None:
         )
         return _run_query(sql, database=database)
 
-    @mcp.tool()
+    @mcp.tool(annotations=_RO)
     def list_columns(database: str, table: str, schema: str = "public") -> dict:
         """
         List all columns and their types for a table.
@@ -200,7 +205,7 @@ def register_tools(mcp: FastMCP) -> None:
         )
         return _run_query(sql, database=database)
 
-    @mcp.tool()
+    @mcp.tool(annotations=_RO)
     def execute_query(database: str, sql: str) -> dict:
         """
         Execute a read-only SELECT query against a client database.

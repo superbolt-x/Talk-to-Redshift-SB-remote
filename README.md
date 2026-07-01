@@ -29,17 +29,24 @@ Read-only Redshift MCP server for Claude. Deploy on Railway and connect your who
 | `REDSHIFT_CLUSTER_ID` | Cluster identifier (provisioned) **or** |
 | `REDSHIFT_WORKGROUP` | Workgroup name (serverless) |
 | `REDSHIFT_DB_USER` | DB user for provisioned clusters |
-| `SERVER_URL` | Your Railway public URL, e.g. `https://your-app.railway.app` |
-| `MCP_AUTH_TOKEN` | Passphrase your team uses to authorize Claude |
+| `SERVER_URL` | Your Railway public URL, e.g. `https://your-app.railway.app` (used for the host allowlist) |
+| `MCP_AUTH_TOKEN` | Optional shared token embedded in the connector URL. Empty = fully open |
 
 ### 4. Connect Claude
 
-In Claude.ai → Settings → Integrations → Add MCP Server:
+**Auth model: authless (Parker-style).** No OAuth/login step. Access is controlled by
+the optional token embedded in the connector URL. In Claude → Settings → Connectors →
+Add custom connector:
 ```
-https://your-app.railway.app/mcp
+https://your-app.railway.app/mcp?access_token=<MCP_AUTH_TOKEN>
 ```
+The server validates the token from the URL (or an `Authorization: Bearer` header); if
+`MCP_AUTH_TOKEN` is empty it runs fully open. `/health` is always open. On Team/Enterprise
+an Owner can add the connector org-wide so it appears for everyone with no per-user login.
 
-Each team member enters the `MCP_AUTH_TOKEN` passphrase once in their browser.
+> The URL-embedded token is a shared secret (leaks via logs/history; rotating it means
+> re-distributing the URL). All tools are read-only, so the main risk is data exposure —
+> keep the URL private.
 
 ## IAM permissions required
 
